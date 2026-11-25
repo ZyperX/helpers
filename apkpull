@@ -1,1 +1,271 @@
-wget https://d.apkpure.com/b/APK/$@?version=latest
+#!/usr/bin/env bash
+#
+# apkpull - download the latest APK for an Android application.
+#
+# Accepts a package identifier (com.whatsapp), a Play Store link, or a plain
+# app name (whatsapp). Names are resolved to package identifiers through the
+# Play Store; the APK itself is fetched from APKPure's direct download endpoint.
+#
+# If the system resolver returns an unreachable address for APKPure, the
+# download is retried through DNS-over-HTTPS.
+
+set -euo pipefail
+
+PROG=${0##*/}
+UA='Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
+APKPURE_HOST='d.apkpure.com'
+PLAY_STORE='https://play.google.com'
+PKG_RE='^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'
+
+LIST_ONLY=0
+OUTPUT=''
+DL_DIR='.'
+TARGETS=()
+HEADER_FILE=''
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options] <app>...
+
+Download the latest APK for an Android application.
+
+<app> can be:
+  package id        com.whatsapp
+  Play Store link   https://play.google.com/store/apps/details?id=com.whatsapp
+  app name          whatsapp        (resolved via the Play Store)
+
+Options:
+  -l, --list          list the matching Play Store package ids, don't download
+  -o, --output FILE   write the APK to FILE (single app only)
+  -d, --dir DIR       download directory (default: current directory)
+  -h, --help          show this help
+
+Apps distributed as split APKs are saved as .xapk bundles.
+
+Examples:
+  $PROG whatsapp
+  $PROG "WhatsApp Messenger" -d ~/apks
+  $PROG com.termux -o termux.apk
+EOF
+}
+
+cleanup() { [[ -n $HEADER_FILE && -f $HEADER_FILE ]] && rm -f "$HEADER_FILE"; return 0; }
+trap cleanup EXIT
+
+while (($#)); do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        -l|--list) LIST_ONLY=1 ;;
+        -o|--output) [[ $# -ge 2 ]] || die "$1 needs an argument"; OUTPUT=$2; shift ;;
+        -d|--dir) [[ $# -ge 2 ]] || die "$1 needs an argument"; DL_DIR=$2; shift ;;
+        --) shift; TARGETS+=("$@"); break ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *) TARGETS+=("$1") ;;
+    esac
+    shift
+done
+
+((${#TARGETS[@]})) || { usage >&2; exit 1; }
+[[ -z $OUTPUT || ${#TARGETS[@]} -eq 1 ]] || die "--output can only be used with a single app"
+
+for bin in curl; do
+    command -v "$bin" >/dev/null 2>&1 || die "missing dependency: $bin"
+done
+
+HEADER_FILE=$(mktemp "${TMPDIR:-/tmp}/apkpull-headers.XXXXXX")
+
+# Strip any Play Store / APKPure link down to its package id.
+package_from_input() {
+    local in=$1 pkg
+    if [[ $in =~ $PKG_RE ]]; then
+        printf '%s' "$in"
+        return 0
+    fi
+    if [[ $in == *id=* ]]; then
+        pkg=${in##*id=}
+        pkg=${pkg%%[&#]*}
+        if [[ $pkg =~ $PKG_RE ]]; then
+            printf '%s' "$pkg"
+            return 0
+        fi
+    fi
+    if [[ $in == http*apkpure* ]]; then
+        pkg=${in%%\?*}
+        pkg=${pkg%/}
+        pkg=${pkg##*/}
+        if [[ $pkg =~ $PKG_RE ]]; then
+            printf '%s' "$pkg"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Search the Play Store and print matching package ids, most relevant first.
+play_search() {
+    local query=$1 html
+    html=$(curl -sS --get -m 30 -A "$UA" \
+        --data-urlencode "q=$query" \
+        --data-urlencode "c=apps" \
+        --data "hl=en" --data "gl=US" \
+        "$PLAY_STORE/store/search" 2>/dev/null) || return 1
+    printf '%s' "$html" \
+        | grep -o 'details?id=[A-Za-z0-9_][A-Za-z0-9._]*' \
+        | sed 's/^details?id=//' \
+        | awk '!seen[$0]++'
+}
+
+doh_ips() {
+    local provider json ips
+    for provider in 'https://dns.google/resolve' 'https://cloudflare-dns.com/dns-query'; do
+        json=$(curl -sS -m 10 -H 'accept: application/dns-json' \
+            --get --data "name=$APKPURE_HOST" --data 'type=A' \
+            "$provider" 2>/dev/null) || continue
+        ips=$(printf '%s' "$json" \
+            | grep -oE '"data"[[:space:]]*:[[:space:]]*"[0-9.]+"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -n 3)
+        if [[ -n $ips ]]; then
+            printf '%s\n' "$ips"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True when the system resolver returns an address that public DNS does not
+# know about (typical of a stale or hijacked resolver). Only claims staleness
+# when the public lookup succeeds, so offline/split-horizon setups still work.
+dns_looks_stale() {
+    local sys ips ip
+    command -v getent >/dev/null 2>&1 || return 1
+    sys=$(getent ahostsv4 "$APKPURE_HOST" 2>/dev/null | awk '{ print $1 }' | sort -u) || true
+    [[ -n $sys ]] || return 1
+    ips=$(doh_ips) || return 1
+    while read -r ip; do
+        [[ -z $ip ]] && continue
+        grep -qxF "$ip" <<<"$ips" && return 1
+    done <<<"$sys"
+    return 0
+}
+
+# curl with sane defaults. Sets HTTP_CODE; returns 0 only on a 200 response.
+# Retries transport failures (resets, timeouts); real HTTP errors fail fast.
+try_download() {
+    local url=$1 out=$2 attempt; shift 2
+    for attempt in 1 2 3; do
+        rm -f "$out"
+        HTTP_CODE=$(curl -sS -L --connect-timeout 6 --max-time 900 \
+            -A "$UA" -H 'Accept: */*' -D "$HEADER_FILE" \
+            -o "$out" -w '%{http_code}' "$@" "$url") || HTTP_CODE=000
+        [[ $HTTP_CODE == 200 ]] && return 0
+        [[ $HTTP_CODE == 000 ]] || return 1
+        ((attempt < 3)) && sleep 1
+    done
+    return 1
+}
+
+# Download into a staging file, then move to its final name.
+# Prints the final path on stdout; progress goes to stderr.
+download_apk() {
+    local pkg=$1 url stage dest name ip
+    url="https://$APKPURE_HOST/b/APK/$pkg?version=latest"
+    stage="$DL_DIR/.apkpull-$pkg.$$.part"
+    HTTP_CODE=000
+
+    if dns_looks_stale; then
+        info "[!] system DNS for $APKPURE_HOST looks stale, using public DNS"
+        while read -r ip; do
+            info "    $APKPURE_HOST -> $ip"
+            try_download "$url" "$stage" --resolve "$APKPURE_HOST:443:$ip" && break
+        done < <(doh_ips || true)
+    elif ! try_download "$url" "$stage"; then
+        info "[!] download attempt failed (HTTP $HTTP_CODE), retrying over IPv4"
+        if ! try_download "$url" "$stage" -4; then
+            info "[!] IPv4 attempt failed (HTTP $HTTP_CODE), retrying via DNS-over-HTTPS"
+            while read -r ip; do
+                info "    $APKPURE_HOST -> $ip"
+                try_download "$url" "$stage" --resolve "$APKPURE_HOST:443:$ip" && break
+            done < <(doh_ips || true)
+        fi
+    fi
+
+    if [[ $HTTP_CODE != 200 ]]; then
+        if [[ -s $stage ]]; then
+            info "[!] server response:"
+            head -c 300 "$stage" >&2
+            printf '\n' >&2
+        fi
+        rm -f "$stage"
+        die "could not download '$pkg' (HTTP $HTTP_CODE)"
+    fi
+
+    if [[ $(head -c 2 "$stage") != 'PK' ]]; then
+        info "[!] downloaded content is not an APK:"
+        head -c 300 "$stage" >&2
+        printf '\n' >&2
+        rm -f "$stage"
+        die "'$pkg' does not look like a downloadable APK on APKPure"
+    fi
+
+    name=$(apk_filename "$pkg")
+    if [[ -n $OUTPUT ]]; then
+        dest=$OUTPUT
+        [[ -d $dest ]] && dest="$dest/$name"
+    else
+        dest="$DL_DIR/$name"
+    fi
+
+    mv -f "$stage" "$dest"
+    printf '%s\n' "$dest"
+}
+
+# Derive a filename from Content-Disposition, falling back to the package id.
+apk_filename() {
+    local pkg=$1 name
+    name=$(sed -n 's/^[Cc]ontent-[Dd]isposition:.*filename="\{0,1\}\([^";]*\).*/\1/p' \
+        "$HEADER_FILE" | tail -n 1 | tr -d '\r')
+    name=$(printf '%s' "$name" | sed 's#[/\\]#_#g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ -z $name || $name == '.' || $name == '..' ]]; then
+        name="$pkg.apk"
+    fi
+    printf '%s' "$name"
+}
+
+mkdir -p "$DL_DIR"
+[[ -d $DL_DIR ]] || die "not a directory: $DL_DIR"
+
+for target in "${TARGETS[@]}"; do
+    if pkg=$(package_from_input "$target"); then
+        :
+    else
+        matches=()
+        while IFS= read -r line; do
+            [[ -n $line ]] && matches+=("$line")
+        done < <(play_search "$target" || true)
+        ((${#matches[@]})) || die "no Play Store app found for '$target' (try passing the package id)"
+
+        if ((LIST_ONLY)); then
+            printf '%s\n' "${matches[@]}"
+            continue
+        fi
+
+        pkg=${matches[0]}
+        info "[+] Resolved '$target' -> $pkg"
+        if ((${#matches[@]} > 1)); then
+            info "    other matches: ${matches[*]:1:4}"
+        fi
+    fi
+
+    if ((LIST_ONLY)); then
+        printf '%s\n' "$pkg"
+        continue
+    fi
+
+    info "[+] Downloading $pkg ..."
+    dest=$(download_apk "$pkg")
+    info "[+] Saved: $dest ($(du -h "$dest" | cut -f1))"
+done
