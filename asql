@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Check dependencies
+for cmd in sqlmap; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "[!] Missing dependency: $cmd"
+        exit 1
+    }
+done
+
+# Read clipboard
+if command -v xclip >/dev/null 2>&1; then
+    REQUEST=$(xclip -selection clipboard -o)
+elif command -v xsel >/dev/null 2>&1; then
+    REQUEST=$(xsel --clipboard --output)
+elif command -v wl-paste >/dev/null 2>&1; then
+    REQUEST=$(wl-paste --no-newline)
+elif command -v pbpaste >/dev/null 2>&1; then
+    REQUEST=$(pbpaste)
+else
+    echo "[!] No supported clipboard utility found."
+    exit 1
+fi
+
+[[ -n "$REQUEST" ]] || {
+    echo "[!] Clipboard is empty."
+    exit 1
+}
+
+# Extract request URI from first HTTP line
+REQUEST_LINE=$(printf '%s\n' "$REQUEST" | head -n 1)
+URI=$(printf '%s\n' "$REQUEST_LINE" | awk '{print $2}')
+
+if [[ -z "$URI" ]]; then
+    echo "[!] Could not extract URI from HTTP request."
+    exit 1
+fi
+
+# Remove query string and trailing slash
+URI_PATH="${URI%%\?*}"
+URI_PATH="${URI_PATH%/}"
+
+# Extract last URI segment
+FILENAME=$(basename "$URI_PATH")
+
+# Handle root URI
+[[ -n "$FILENAME" && "$FILENAME" != "." ]] || FILENAME="root"
+
+# Sanitize filename
+FILENAME=$(printf '%s' "$FILENAME" | tr -cd '[:alnum:]_.-')
+
+[[ -n "$FILENAME" ]] || FILENAME="request"
+
+REQ_FILE="${FILENAME}.req"
+
+# Save request
+printf '%s\n' "$REQUEST" > "$REQ_FILE"
+
+echo "[+] Request saved: $REQ_FILE"
+echo "[+] Starting sqlmap..."
+echo
+
+# Run sqlmap
+sqlmap -r "$REQ_FILE" --batch $@
