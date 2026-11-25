@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+#
+# ajwt - run jwt_tool against a raw HTTP request (e.g. copied from Burp Suite).
+#
+# Reads a raw request from the clipboard (or a file/stdin), extracts the JWT,
+# and drives ticarpi/jwt_tool:
+#   recon  decode/validate the token (offline)
+#   bf     dictionary attack against the HMAC secret (offline)
+#   scan   playbook / error / common-claim / all-tests scan of the live app
+#
+# jwt_tool: https://github.com/ticarpi/jwt_tool
+
+set -euo pipefail
+
+PROG=${0##*/}
+JWT_REPO='https://github.com/ticarpi/jwt_tool'
+AJWT_HOME=${AJWT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ajwt}
+JWT_CONF=${JWT_CONF:-$HOME/.jwt_tool/jwtconf.ini}
+
+COMMAND=''
+CMD_ARGS=()
+EXTRA=()
+REQ_SRC=''
+REQ_OUT=''
+WORDLIST=''
+SCHEME='https'
+TOKEN_INDEX=0
+
+JWT_BIN=''
+JWT_PY=''
+JWT_DIR=''
+JWT_CMD=()
+PY=python3
+SHIM_DIR=''
+REQ_FILE=''
+DATA=''
+
+die() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+cleanup() {
+    [[ -n $SHIM_DIR && -d $SHIM_DIR ]] && rm -rf "$SHIM_DIR"
+    return 0
+}
+trap cleanup EXIT
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options] <command> [args]
+
+Run jwt_tool against the raw HTTP request in your clipboard.
+
+Commands:
+  recon            decode and inspect the token (offline)
+  bf [wordlist]    dictionary attack on the HMAC secret (offline)
+  scan [mode]      scan the live application with the request:
+                     pb  playbook audit (default)
+                     er  fuzz claims to force errors
+                     cc  fuzz common claims
+                     at  all tests
+  token            print the JWT found in the request
+  setup            install jwt_tool into $AJWT_HOME
+
+Options:
+  -r, --request FILE    read the request from FILE ('-' for stdin)
+                        default: clipboard
+  -i, --http            target is HTTP (default: HTTPS)
+      --token N         use the Nth token when the request has several
+  -w, --wordlist FILE   wordlist for 'bf'
+  -c, --canary TEXT     expected text in valid responses (jwt_tool -cv)
+      --no-proxy        do not use the proxy from jwtconf.ini
+  -o, --out FILE        save the parsed request to FILE
+  -h, --help            show this help
+  -- ARGS...            pass the remaining ARGS to jwt_tool
+
+Examples:
+  $PROG recon
+  $PROG bf
+  $PROG bf /usr/share/wordlists/rockyou.txt
+  $PROG scan
+  $PROG scan at -c "Welcome back"
+  $PROG -- -X a
+EOF
+}
+
+# ---------------------------------------------------------------- arguments
+
+while (($#)); do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        -r|--request) [[ $# -ge 2 ]] || die "$1 needs an argument"; REQ_SRC=$2; shift ;;
+        -i|--http) SCHEME='http' ;;
+        --https) SCHEME='https' ;;
+        --token) [[ $# -ge 2 ]] || die "$1 needs an argument"; TOKEN_INDEX=$2; shift ;;
+        -w|--wordlist) [[ $# -ge 2 ]] || die "$1 needs an argument"; WORDLIST=$2; shift ;;
+        -c|--canary) [[ $# -ge 2 ]] || die "$1 needs an argument"; EXTRA+=(-cv "$2"); shift ;;
+        --no-proxy) EXTRA+=(-np) ;;
+        -o|--out) [[ $# -ge 2 ]] || die "$1 needs an argument"; REQ_OUT=$2; shift ;;
+        --) shift; EXTRA+=("$@"); break ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *)
+            if [[ -z $COMMAND ]]; then
+                COMMAND=$1
+            else
+                CMD_ARGS+=("$1")
+            fi
+            ;;
+    esac
+    shift
+done
+
+[[ -z $TOKEN_INDEX || $TOKEN_INDEX =~ ^[0-9]+$ ]] || die "--token expects a number"
+
+# ------------------------------------------------------------ jwt_tool lookup
+
+find_jwt_tool() {
+    if [[ -n ${JWT_TOOL:-} ]]; then
+        if [[ $JWT_TOOL == *.py ]]; then
+            [[ -f $JWT_TOOL ]] || die "no such file: $JWT_TOOL"
+            JWT_PY=$JWT_TOOL
+        elif [[ -x $JWT_TOOL ]]; then
+            JWT_BIN=$JWT_TOOL
+        elif [[ -f $JWT_TOOL ]]; then
+            die "not executable: $JWT_TOOL"
+        else
+            JWT_BIN=$(command -v "$JWT_TOOL" 2>/dev/null) || die "JWT_TOOL not found: $JWT_TOOL"
+        fi
+    elif command -v jwt_tool >/dev/null 2>&1; then
+        JWT_BIN=$(command -v jwt_tool)
+    elif command -v jwt_tool.py >/dev/null 2>&1; then
+        JWT_PY=$(command -v jwt_tool.py)
+    elif [[ -f $AJWT_HOME/jwt_tool/jwt_tool.py ]]; then
+        JWT_PY=$AJWT_HOME/jwt_tool/jwt_tool.py
+    elif [[ -f $HOME/jwt_tool/jwt_tool.py ]]; then
+        JWT_PY=$HOME/jwt_tool/jwt_tool.py
+    else
+        return 1
+    fi
+
+    if [[ -n $JWT_PY ]]; then
+        JWT_DIR=$(dirname "$JWT_PY")
+        [[ -x $JWT_DIR/.venv/bin/python ]] && PY=$JWT_DIR/.venv/bin/python
+        JWT_CMD=("$PY" "$JWT_PY")
+    else
+        JWT_DIR=$(dirname "$JWT_BIN")
+        # Installers often leave a wrapper that points at the real script;
+        # follow it so jwt-common.txt and the playbook can be found.
+        local ref
+        ref=$(grep -oE '/[^"[:space:]]*jwt_tool\.py' "$JWT_BIN" 2>/dev/null | head -n 1) || true
+        [[ -n $ref && -f $ref ]] && JWT_DIR=$(dirname "$ref")
+        JWT_CMD=("$JWT_BIN")
+    fi
+    command -v "$PY" >/dev/null 2>&1 || die "python3 is required to run jwt_tool"
+}
+
+# Directory holding jwt-common.txt, used for cracking and by the playbook.
+jwt_common_dir() {
+    local d
+    for d in "$JWT_DIR" "$AJWT_HOME/jwt_tool" "$HOME/jwt_tool"; do
+        [[ -n $d && -f $d/jwt-common.txt ]] && { printf '%s\n' "$d"; return 0; }
+    done
+    return 1
+}
+
+# Pull a complete token out of arbitrary text, most relevant one first.
+extract_tokens() {
+    grep -oE 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*' <<<"$1" | awk '!seen[$0]++'
+}
+
+b64url_decode() {
+    local s=$1
+    s=${s//-/+}
+    s=${s//_/\/}
+    case $((${#s} % 4)) in
+        2) s+='==' ;;
+        3) s+='=' ;;
+    esac
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+token_alg() {
+    local header
+    header=$(b64url_decode "${1%%.*}")
+    sed -n 's/.*"alg"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$header"
+}
+
+# jwt_tool 2.3.0 writes config keys containing ':' which Python 3.13+ rejects.
+# Put an import-time shim on PYTHONPATH so the tool behaves as it did before.
+setup_compat_shim() {
+    command -v "$PY" >/dev/null 2>&1 || return 0
+    "$PY" -c 'import sys, configparser
+sys.exit(0 if sys.version_info[:2] >= (3, 13) and hasattr(configparser.RawConfigParser, "_validate_key_contents") else 1)' \
+        2>/dev/null || return 0
+    SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ajwt-shim.XXXXXX")
+    cat >"$SHIM_DIR/sitecustomize.py" <<'EOF'
+import configparser
+configparser.RawConfigParser._validate_key_contents = lambda self, key: None
+EOF
+    export PYTHONPATH="$SHIM_DIR${PYTHONPATH:+:$PYTHONPATH}"
+}
+
+jwt_run() { "${JWT_CMD[@]}" "$@"; }
+
+# jwt_tool exits 1 even when it succeeds, so only propagate real signals.
+finish() { (( $1 >= 128 )) && exit "$1"; exit 0; }
+
+# The playbook's weak-secret step opens "jwt-common.txt" relative to the
+# working directory, so scans run from jwt_tool's own directory.
+jwt_run_scan() {
+    local d
+    if d=$(jwt_common_dir); then
+        (cd "$d" && "${JWT_CMD[@]}" "$@")
+    else
+        info "[!] jwt-common.txt not found; the playbook's weak-secret check"
+        info "    will be skipped"
+        "${JWT_CMD[@]}" "$@"
+    fi
+}
+
+# jwt_tool's first run only generates its config (and exits), and an
+# interrupted first run can leave a config without the [argvals] section.
+ensure_config() {
+    local token=$1
+    if [[ -f $JWT_CONF ]] && ! grep -q '^\[argvals\]' "$JWT_CONF"; then
+        mv "$JWT_CONF" "$JWT_CONF.incomplete.$(date +%s)"
+        info "[!] moved incomplete jwtconf.ini aside"
+    fi
+    if [[ ! -f $JWT_CONF ]]; then
+        info "[*] first run: generating jwt_tool config and keys"
+        jwt_run "$token" -b >/dev/null 2>&1 || true
+        # an outdated config is moved aside first, so try once more
+        [[ -f $JWT_CONF ]] || jwt_run "$token" -b >/dev/null 2>&1 || true
+        [[ -f $JWT_CONF ]] || die "jwt_tool could not create $JWT_CONF"
+    fi
+}
+
+# ------------------------------------------------------------------- input
+
+read_clipboard() {
+    if command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard -o 2>/dev/null
+    elif command -v xsel >/dev/null 2>&1; then
+        xsel --clipboard --output 2>/dev/null
+    elif command -v wl-paste >/dev/null 2>&1; then
+        wl-paste --no-newline 2>/dev/null
+    elif command -v pbpaste >/dev/null 2>&1; then
+        pbpaste 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+read_request() {
+    local data=''
+    if [[ -n $REQ_SRC ]]; then
+        if [[ $REQ_SRC == - ]]; then
+            data=$(cat) || true
+        else
+            [[ -f $REQ_SRC ]] || die "no such file: $REQ_SRC"
+            data=$(cat "$REQ_SRC") || true
+        fi
+    elif [[ ! -t 0 ]]; then
+        data=$(cat) || true
+    fi
+
+    if [[ -z $data ]]; then
+        data=$(read_clipboard) || true
+    fi
+    [[ -n $data ]] || die "no request found (clipboard is empty and no -r given)"
+
+    printf '%s\n' "$data" | tr -d '\r' | sed '/./,$!d'
+}
+
+save_request() {
+    local data=$1 uri path name
+    if [[ -n $REQ_OUT ]]; then
+        REQ_FILE=$REQ_OUT
+    elif [[ -n $REQ_SRC && $REQ_SRC != '-' ]]; then
+        REQ_FILE=$REQ_SRC
+        case $REQ_FILE in /*) ;; *) REQ_FILE=$PWD/$REQ_FILE ;; esac
+        return 0
+    else
+        uri=$(awk 'NR == 1 { print $2; exit }' <<<"$data")
+        path=${uri%%\?*}
+        path=${path%/}
+        name=${path##*/}
+        [[ -n $name && $name != '.' ]] || name=root
+        name=$(printf '%s' "$name" | tr -cd '[:alnum:]_.-')
+        [[ -n $name ]] || name=request
+        REQ_FILE="$name.req"
+    fi
+    case $REQ_FILE in /*) ;; *) REQ_FILE=$PWD/$REQ_FILE ;; esac
+    printf '%s\n' "$data" >"$REQ_FILE"
+}
+
+print_target() {
+    local host path
+    host=$(awk 'tolower($1) == "host:" { print $2; exit }' <<<"$DATA")
+    path=$(awk 'NR == 1 { print $2; exit }' <<<"$DATA")
+    if [[ -n $host ]]; then
+        info "[+] Target: $SCHEME://$host$path"
+    else
+        info "[!] no Host header in the request; scans need one"
+    fi
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_setup() {
+    command -v git >/dev/null 2>&1 || die "git is required for setup"
+    command -v "$PY" >/dev/null 2>&1 || die "python3 is required for setup"
+
+    local dir="$AJWT_HOME/jwt_tool"
+    mkdir -p "$AJWT_HOME"
+    if [[ ! -f $dir/jwt_tool.py ]]; then
+        info "[*] cloning jwt_tool into $dir"
+        git clone --depth 1 "$JWT_REPO" "$dir" >&2 || die "git clone failed"
+    fi
+    info "[*] installing python dependencies"
+    "$PY" -m venv "$dir/.venv" >&2 || die "could not create a virtualenv"
+    "$dir/.venv/bin/pip" install -q -r "$dir/requirements.txt" >&2 || die "pip install failed"
+    info "[+] jwt_tool installed at $dir"
+    info "    try: $PROG recon"
+}
+
+cmd_recon() {
+    info "[+] Token: ${TOKEN:0:24}... (${ALG:-unknown alg})"
+    local rc=0
+    jwt_run "$TOKEN" "${EXTRA[@]}" || rc=$?
+    finish "$rc"
+}
+
+cmd_bf() {
+    local list=${WORDLIST:-${CMD_ARGS[0]:-}} d
+    if [[ -z $list ]]; then
+        if d=$(jwt_common_dir); then
+            list=$d/jwt-common.txt
+        else
+            for list in "$HOME/wordlists/rockyou.txt" \
+                        "/usr/share/wordlists/rockyou.txt"; do
+                [[ -f $list ]] && break
+            done
+        fi
+    fi
+    [[ -f ${list:-} ]] || die "no wordlist found (pass one: $PROG bf /path/wordlist.txt)"
+
+    info "[+] Token: ${TOKEN:0:24}... (${ALG:-unknown alg})"
+    info "[+] Wordlist: $list"
+    if [[ -n $ALG && $ALG != HS* ]]; then
+        info "[!] '$ALG' is not HMAC; jwt_tool -C only cracks HS256/384/512"
+    fi
+
+    local rc=0
+    jwt_run "$TOKEN" -C -d "$list" "${EXTRA[@]}" || rc=$?
+    finish "$rc"
+}
+
+cmd_scan() {
+    local mode=${CMD_ARGS[0]:-pb} rc=0
+    case $mode in pb|er|cc|at) ;; *) die "unknown scan mode: $mode (pb, er, cc, at)" ;; esac
+    [[ -n $(awk 'tolower($1) == "host:" { print $2; exit }' <<<"$DATA") ]] ||
+        die "scan needs a Host header in the request"
+
+    # jwt_tool -r only looks for tokens in cookies, headers and POST data.
+    local rest
+    rest=$(tail -n +2 <<<"$DATA")
+    [[ $rest == *"$TOKEN"* ]] ||
+        die "the token is only in the request line; jwt_tool -r reads cookies, headers and body"
+
+    print_target
+    info "[+] Scanning with mode '$mode' (Ctrl-C to stop)"
+
+    local args=(-r "$REQ_FILE" -M "$mode")
+    [[ $SCHEME == http ]] && args+=(-i)
+    jwt_run_scan "${args[@]}" "${EXTRA[@]}" || rc=$?
+    finish "$rc"
+}
+
+cmd_flow() {
+    print_target
+    local rc=0 args=(-r "$REQ_FILE")
+    [[ $SCHEME == http ]] && args+=(-i)
+    jwt_run_scan "${args[@]}" "${EXTRA[@]}" || rc=$?
+    finish "$rc"
+}
+
+cmd_token() { printf '%s\n' "$TOKEN"; }
+
+# --------------------------------------------------------------------- main
+
+case $COMMAND in
+    setup) cmd_setup; exit 0 ;;
+esac
+
+find_jwt_tool || die "jwt_tool not found - install it with: $PROG setup"
+
+setup_compat_shim
+
+DATA=$(read_request)
+
+FIRST_LINE=$(awk 'NR == 1 { print; exit }' <<<"$DATA")
+[[ $FIRST_LINE =~ ^[A-Z]+[[:space:]]+[^[:space:]]+[[:space:]]+HTTP/[0-9.]+$ ]] ||
+    die "input is not a raw HTTP request (expected 'METHOD /path HTTP/1.1')"
+
+save_request "$DATA"
+
+TOKENS=()
+while IFS= read -r t; do
+    [[ -n $t ]] && TOKENS+=("$t")
+done < <(extract_tokens "$DATA")
+
+((${#TOKENS[@]})) || die "no JWT found in the request"
+if ((TOKEN_INDEX > 0)); then
+    ((TOKEN_INDEX <= ${#TOKENS[@]})) || die "--token $TOKEN_INDEX is out of range (found ${#TOKENS[@]})"
+    TOKEN=${TOKENS[TOKEN_INDEX - 1]}
+else
+    TOKEN=${TOKENS[0]}
+    if ((${#TOKENS[@]} > 1)); then
+        info "[!] ${#TOKENS[@]} different tokens found; using the first (pick another with --token N)"
+    fi
+fi
+ALG=$(token_alg "$TOKEN")
+
+[[ -n $COMMAND ]] || { ((${#EXTRA[@]})) && COMMAND=flow || { usage >&2; exit 1; }; }
+
+[[ $COMMAND == token || $COMMAND == show ]] || ensure_config "$TOKEN"
+
+case $COMMAND in
+    recon|decode) cmd_recon ;;
+    bf|crack) cmd_bf ;;
+    scan|playbook) cmd_scan ;;
+    token|show) cmd_token ;;
+    flow) cmd_flow ;;
+    *) die "unknown command: $COMMAND (try --help)" ;;
+esac
